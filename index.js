@@ -238,13 +238,13 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
 
 app.post("/register", (req, res) => {
   const client_id     = randomBytes(16).toString("hex")
-  const client_secret = randomBytes(32).toString("hex")
   const redirect_uris = (req.body && req.body.redirect_uris) || []
-  oauthClients.set(client_id, { client_secret, redirect_uris })
+  oauthClients.set(client_id, { redirect_uris })
   res.status(201).json({
-    client_id, client_secret, redirect_uris,
-    grant_types: ["authorization_code"],
-    response_types: ["code"],
+    client_id,
+    redirect_uris,
+    grant_types:                ["authorization_code"],
+    response_types:             ["code"],
     token_endpoint_auth_method: "none"
   })
 })
@@ -252,12 +252,12 @@ app.post("/register", (req, res) => {
 // catch JSON parse errors so /register never returns 400
 app.use((err, req, res, next) => {
   if (err.status === 400 && err.type === "entity.parse.failed") {
-    const client_id     = randomBytes(16).toString("hex")
-    const client_secret = randomBytes(32).toString("hex")
+    const client_id = randomBytes(16).toString("hex")
     return res.status(201).json({
-      client_id, client_secret, redirect_uris: [],
-      grant_types: ["authorization_code"],
-      response_types: ["code"],
+      client_id,
+      redirect_uris:              [],
+      grant_types:                ["authorization_code"],
+      response_types:             ["code"],
       token_endpoint_auth_method: "none"
     })
   }
