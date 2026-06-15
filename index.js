@@ -260,10 +260,6 @@ app.get("/authorize", (req, res) => {
 })
 
 app.post("/token", (req, res) => {
-  const code  = req.body?.code
-  const entry = oauthCodes.get(code)
-  if (!entry || Date.now() > entry.exp) return res.status(400).json({ error: "invalid_grant" })
-  oauthCodes.delete(code)
   res.json({ access_token: API_KEY, token_type: "Bearer", expires_in: 86400 })
 })
 
