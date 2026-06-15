@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { join, extname, basename } from "path"
 import { fileURLToPath } from "url"
 import { dirname } from "path"
+import { randomBytes } from "crypto"
 import { z } from "zod"
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -204,6 +205,40 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, mcp-session-id")
   if (req.method === "OPTIONS") return res.sendStatus(204)
   next()
+})
+
+// ── OAuth (stub — satisfies Claude.ai connector handshake, no real auth) ──────
+
+app.use(express.urlencoded({ extended: false }))
+
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  res.json({
+    issuer:                 PUBLIC_URL,
+    authorization_endpoint: `${PUBLIC_URL}/authorize`,
+    token_endpoint:         `${PUBLIC_URL}/token`,
+    response_types_supported: ["code"],
+    grant_types_supported:    ["authorization_code"],
+    code_challenge_methods_supported: ["S256"]
+  })
+})
+
+// Auto-approve: immediately redirect back with a code — no login screen
+app.get("/authorize", (req, res) => {
+  const { redirect_uri, state } = req.query
+  const code = randomBytes(16).toString("hex")
+  const url  = new URL(redirect_uri)
+  url.searchParams.set("code", code)
+  if (state) url.searchParams.set("state", state)
+  res.redirect(url.toString())
+})
+
+// Exchange code for a token — everyone gets the same access token (the API key)
+app.post("/token", express.json(), (req, res) => {
+  res.json({
+    access_token: API_KEY,
+    token_type:   "Bearer",
+    expires_in:   86400
+  })
 })
 
 // ── MCP endpoint ──────────────────────────────────────────────────────────────
