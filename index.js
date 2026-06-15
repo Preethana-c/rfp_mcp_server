@@ -207,51 +207,126 @@ app.use((req, res, next) => {
   next()
 })
 
-// ── OAuth (stub — satisfies Claude.ai connector handshake, no real auth) ──────
+// ── OAuth 2.0 (proper flow with consent screen for Claude.ai connector) ────────
 
 app.use(express.urlencoded({ extended: false }))
 
+const oauthClients = new Map()  // client_id → { client_secret, redirect_uris }
+const oauthCodes   = new Map()  // code → { redirect_uri, expires }
+
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   res.json({
-    issuer:                        PUBLIC_URL,
-    authorization_endpoint:        `${PUBLIC_URL}/authorize`,
-    token_endpoint:                `${PUBLIC_URL}/token`,
-    registration_endpoint:         `${PUBLIC_URL}/register`,
-    response_types_supported:      ["code"],
-    grant_types_supported:         ["authorization_code"],
-    code_challenge_methods_supported: ["S256"]
+    issuer:                           PUBLIC_URL,
+    authorization_endpoint:           `${PUBLIC_URL}/authorize`,
+    token_endpoint:                   `${PUBLIC_URL}/token`,
+    registration_endpoint:            `${PUBLIC_URL}/register`,
+    response_types_supported:         ["code"],
+    grant_types_supported:            ["authorization_code"],
+    token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post", "none"],
+    code_challenge_methods_supported: ["S256", "plain"]
   })
 })
 
-// Dynamic client registration — Claude.ai registers itself before the OAuth flow
+// Dynamic client registration
 app.post("/register", express.json(), (req, res) => {
+  const client_id     = randomBytes(16).toString("hex")
+  const client_secret = randomBytes(32).toString("hex")
+  oauthClients.set(client_id, { client_secret, redirect_uris: req.body?.redirect_uris || [] })
   res.status(201).json({
-    client_id:                randomBytes(16).toString("hex"),
-    client_secret:            randomBytes(32).toString("hex"),
-    redirect_uris:            req.body?.redirect_uris || [],
-    grant_types:              ["authorization_code"],
-    response_types:           ["code"],
-    token_endpoint_auth_method: "client_secret_basic"
+    client_id,
+    client_secret,
+    redirect_uris:              req.body?.redirect_uris || [],
+    grant_types:                ["authorization_code"],
+    response_types:             ["code"],
+    token_endpoint_auth_method: "client_secret_post"
   })
 })
 
-// Auto-approve: immediately redirect back with a code — no login screen
+// Authorization endpoint — shows an Allow/Deny consent page
 app.get("/authorize", (req, res) => {
-  const { redirect_uri, state } = req.query
-  const code = randomBytes(16).toString("hex")
-  const url  = new URL(redirect_uri)
+  const { client_id, redirect_uri, state, code_challenge, code_challenge_method } = req.query
+  const params = new URLSearchParams({ client_id, redirect_uri, state: state||"", code_challenge: code_challenge||"", code_challenge_method: code_challenge_method||"" })
+  res.setHeader("Content-Type", "text/html")
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RFP Wizard — Connect</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #f5f5f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+    .card { background: white; border-radius: 12px; padding: 40px; max-width: 400px; width: 90%; box-shadow: 0 4px 20px rgba(0,0,0,0.1); text-align: center; }
+    h1 { font-size: 1.4rem; margin: 0 0 8px; color: #1a1a1a; }
+    p { color: #555; margin: 0 0 28px; line-height: 1.5; }
+    .logo { font-size: 2.5rem; margin-bottom: 16px; }
+    form { display: inline; }
+    button { padding: 12px 32px; border: none; border-radius: 8px; font-size: 1rem; cursor: pointer; margin: 6px; }
+    .allow { background: #2563eb; color: white; }
+    .allow:hover { background: #1d4ed8; }
+    .deny  { background: #e5e7eb; color: #374151; }
+    .deny:hover  { background: #d1d5db; }
+    .scopes { background: #f0f7ff; border-radius: 8px; padding: 12px 16px; margin: 0 0 24px; text-align: left; font-size: 0.9rem; color: #1e40af; }
+    .scopes li { margin: 4px 0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">📄</div>
+    <h1>RFP Proposal Wizard</h1>
+    <p>Claude is requesting access to your RFP Wizard MCP server.</p>
+    <ul class="scopes">
+      <li>✓ Read company proposal samples</li>
+      <li>✓ Read proposal template</li>
+      <li>✓ Generate branded .docx proposals</li>
+    </ul>
+    <form method="POST" action="/authorize/allow">
+      <input type="hidden" name="client_id" value="${client_id}">
+      <input type="hidden" name="redirect_uri" value="${redirect_uri}">
+      <input type="hidden" name="state" value="${state||""}">
+      <input type="hidden" name="code_challenge" value="${code_challenge||""}">
+      <input type="hidden" name="code_challenge_method" value="${code_challenge_method||""}">
+      <button type="submit" class="allow">Allow Access</button>
+    </form>
+    <form method="POST" action="/authorize/deny">
+      <input type="hidden" name="redirect_uri" value="${redirect_uri}">
+      <input type="hidden" name="state" value="${state||""}">
+      <button type="submit" class="deny">Deny</button>
+    </form>
+  </div>
+</body>
+</html>`)
+})
+
+// User clicked Allow — generate code and redirect back
+app.post("/authorize/allow", (req, res) => {
+  const { redirect_uri, state, code_challenge, code_challenge_method } = req.body
+  const code = randomBytes(32).toString("hex")
+  oauthCodes.set(code, { redirect_uri, code_challenge, code_challenge_method, expires: Date.now() + 600_000 })
+  const url = new URL(redirect_uri)
   url.searchParams.set("code", code)
   if (state) url.searchParams.set("state", state)
   res.redirect(url.toString())
 })
 
-// Exchange code for a token — everyone gets the same access token (the API key)
+// User clicked Deny
+app.post("/authorize/deny", (req, res) => {
+  const { redirect_uri, state } = req.body
+  const url = new URL(redirect_uri)
+  url.searchParams.set("error", "access_denied")
+  if (state) url.searchParams.set("state", state)
+  res.redirect(url.toString())
+})
+
+// Token endpoint — exchange code for access token
 app.post("/token", express.json(), (req, res) => {
-  res.json({
-    access_token: API_KEY,
-    token_type:   "Bearer",
-    expires_in:   86400
-  })
+  const body = req.body || {}
+  const code = body.code || new URLSearchParams(req.body).get?.("code")
+  const entry = oauthCodes.get(code)
+  if (!entry || Date.now() > entry.expires) {
+    return res.status(400).json({ error: "invalid_grant" })
+  }
+  oauthCodes.delete(code)
+  res.json({ access_token: API_KEY, token_type: "Bearer", expires_in: 86400 })
 })
 
 // ── MCP endpoint ──────────────────────────────────────────────────────────────
