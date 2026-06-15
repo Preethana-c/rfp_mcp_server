@@ -213,25 +213,12 @@ app.use(express.urlencoded({ extended: false }))
 
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   res.json({
-    issuer:                        PUBLIC_URL,
-    authorization_endpoint:        `${PUBLIC_URL}/authorize`,
-    token_endpoint:                `${PUBLIC_URL}/token`,
-    registration_endpoint:         `${PUBLIC_URL}/register`,
-    response_types_supported:      ["code"],
-    grant_types_supported:         ["authorization_code"],
+    issuer:                 PUBLIC_URL,
+    authorization_endpoint: `${PUBLIC_URL}/authorize`,
+    token_endpoint:         `${PUBLIC_URL}/token`,
+    response_types_supported: ["code"],
+    grant_types_supported:    ["authorization_code"],
     code_challenge_methods_supported: ["S256"]
-  })
-})
-
-// Dynamic client registration — Claude.ai registers itself before the OAuth flow
-app.post("/register", express.json(), (req, res) => {
-  res.status(201).json({
-    client_id:                randomBytes(16).toString("hex"),
-    client_secret:            randomBytes(32).toString("hex"),
-    redirect_uris:            req.body?.redirect_uris || [],
-    grant_types:              ["authorization_code"],
-    response_types:           ["code"],
-    token_endpoint_auth_method: "client_secret_basic"
   })
 })
 
