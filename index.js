@@ -3,6 +3,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import express from "express"
 import multer from "multer"
 import mammoth from "mammoth"
+import AdmZip from "adm-zip"
 import { execSync } from "child_process"
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs"
 import { join, extname, basename } from "path"
@@ -193,6 +194,44 @@ function createMcpServer() {
       } catch (err) {
         return { content: [{ type: "text", text: `pandoc failed: ${err.message}` }] }
       }
+
+      // ── Post-process: fix table borders and spacing ────────────────────────────
+      // The reference-doc template may have invisible table borders (white on white).
+      // We patch word/document.xml directly inside the .docx ZIP to force visible borders.
+      try {
+        const zip = new AdmZip(outPath)
+        const docEntry = zip.getEntry("word/document.xml")
+
+        if (docEntry) {
+          let xml = docEntry.getData().toString("utf-8")
+
+          // Strip any border definitions copied from the template (often invisible/white)
+          xml = xml.replace(/<w:tblBorders>[\s\S]*?<\/w:tblBorders>/g, "")
+
+          // Inject clean visible borders on every table
+          const borders =
+            "<w:tblBorders>" +
+            '<w:top    w:val="single" w:sz="6" w:space="0" w:color="404040"/>' +
+            '<w:left   w:val="single" w:sz="6" w:space="0" w:color="404040"/>' +
+            '<w:bottom w:val="single" w:sz="6" w:space="0" w:color="404040"/>' +
+            '<w:right  w:val="single" w:sz="6" w:space="0" w:color="404040"/>' +
+            '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="404040"/>' +
+            '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="404040"/>' +
+            "</w:tblBorders>"
+
+          xml = xml.replace(/<w:tblPr>/g, "<w:tblPr>" + borders)
+
+          // Fix spacing: collapse runs of 3+ consecutive empty paragraphs to 1
+          xml = xml.replace(/(<w:p\s*\/>){3,}/g, "<w:p/>")
+          xml = xml.replace(/(<w:p><\/w:p>){3,}/g, "<w:p></w:p>")
+
+          zip.updateFile("word/document.xml", Buffer.from(xml, "utf-8"))
+          zip.writeZip(outPath)
+        }
+      } catch (patchErr) {
+        console.error("Post-process warning (non-fatal):", patchErr.message)
+      }
+      // ──────────────────────────────────────────────────────────────────────────
 
       const downloadUrl = `${PUBLIC_URL}/download/${safeName}`
       const usedTemplate = (tmplPath && existsSync(tmplPath)) ? tmplPath.split("/").pop() + " (branded — logo, header, footer preserved)" : "default Word styles (no template found)"
