@@ -121,12 +121,21 @@ function createMcpServer() {
 
       const output = [
         "=== COMPANY TEMPLATE STRUCTURE ===",
-        "Use this structure for all proposals. Match section order, heading levels, and layout exactly.",
+        `Template file: ${files[0]}`,
         "",
-        "--- HTML (section structure, heading hierarchy, table layouts, image positions) ---",
+        "FORMATTING RULES — apply exactly when writing markdown for this template:",
+        "- Use # for the proposal title (maps to Heading 1)",
+        "- Use ## for main section headings (maps to Heading 2)",
+        "- Use ### for sub-sections (maps to Heading 3)",
+        "- Use regular paragraphs for body text (maps to Normal style)",
+        "- Use | table | syntax for any tables",
+        "- Do NOT add extra blank lines between heading and first paragraph — this affects spacing in Word",
+        "- Page alignment, fonts, logo, header, footer come from the template automatically via pandoc",
+        "",
+        "--- Template HTML structure (section order, heading hierarchy, table layouts) ---",
         result.value,
         "",
-        "--- Plain text (readable summary) ---",
+        "--- Template plain text (readable content summary) ---",
         textResult.value.trim()
       ].join("\n")
 
