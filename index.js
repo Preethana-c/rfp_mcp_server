@@ -175,7 +175,7 @@ function createMcpServer() {
         return { content: [{ type: "text", text: "pandoc is not installed on this server. Add 'RUN apt-get install -y pandoc' to the Dockerfile and redeploy." }] }
       }
 
-      const cmd = existsSync(tmplPath)
+      const cmd = (tmplPath && existsSync(tmplPath))
         ? `pandoc "${mdPath}" -o "${outPath}" --reference-doc="${tmplPath}"`
         : `pandoc "${mdPath}" -o "${outPath}"`
 
@@ -186,7 +186,7 @@ function createMcpServer() {
       }
 
       const downloadUrl = `${PUBLIC_URL}/download/${safeName}`
-      const usedTemplate = existsSync(tmplPath) ? "company-template.docx (branded)" : "default Word styles (no template uploaded)"
+      const usedTemplate = (tmplPath && existsSync(tmplPath)) ? tmplPath.split("/").pop() + " (branded — logo, header, footer preserved)" : "default Word styles (no template found)"
 
       return {
         content: [{
