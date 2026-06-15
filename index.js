@@ -91,6 +91,43 @@ function createMcpServer() {
     }
   )
 
+  // ── Tool: read_template ─────────────────────────────────────────────────────
+  // This is what replaces the "manually upload template in chat" step.
+  // Mammoth converts the .docx to HTML, which preserves structure, section order,
+  // heading hierarchy, table layouts, and notes where images/logos are placed.
+  // Claude reads this exactly like it would read an uploaded template in chat.
+  server.tool(
+    "read_template",
+    "Read the company proposal template — returns its full structure including section layout, heading styles, and where the logo/images are placed. Call this before writing any proposal so the output matches the company template exactly, the same way uploading the template in Claude chat would.",
+    {},
+    async () => {
+      const tmplPath = join(TEMPLATES_DIR, "company-template.docx")
+
+      if (!existsSync(tmplPath)) {
+        return { content: [{ type: "text", text: "No template found. Upload company-template.docx via POST /upload/template on the MCP server." }] }
+      }
+
+      // Convert to HTML — preserves section order, headings, tables, image positions
+      const result = await mammoth.convertToHtml({ path: tmplPath })
+
+      // Also get plain text for a readable summary
+      const textResult = await mammoth.extractRawText({ path: tmplPath })
+
+      const output = [
+        "=== COMPANY TEMPLATE STRUCTURE ===",
+        "Use this structure for all proposals. Match section order, heading levels, and layout exactly.",
+        "",
+        "--- HTML (section structure, heading hierarchy, table layouts, image positions) ---",
+        result.value,
+        "",
+        "--- Plain text (readable summary) ---",
+        textResult.value.trim()
+      ].join("\n")
+
+      return { content: [{ type: "text", text: output }] }
+    }
+  )
+
   // ── Tool: list_templates ────────────────────────────────────────────────────
   server.tool(
     "list_templates",
