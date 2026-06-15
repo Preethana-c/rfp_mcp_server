@@ -9,11 +9,8 @@ COPY package.json ./
 RUN npm install --omit=dev
 
 COPY index.js ./
-
-# These directories hold files uploaded via /upload/sample and /upload/template.
-# For persistence across Railway redeploys, mount a Railway volume at /app/samples
-# and /app/templates. Without a volume, files survive restarts but are wiped on redeploy.
-RUN mkdir -p samples templates
+COPY samples/ samples/
+COPY templates/ templates/
 
 EXPOSE 3000
 

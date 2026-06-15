@@ -47,7 +47,7 @@ function createMcpServer() {
   // ── Tool: list_samples ──────────────────────────────────────────────────────
   server.tool(
     "list_samples",
-    "List all sample proposal files stored on the server (.docx, .pdf, .txt)",
+    "List all of the company's past proposal documents stored on the server — these are proposals the company has previously written and submitted, used as style and structure references when drafting new proposals (.docx, .pdf, .txt)",
     {},
     async () => {
       const files = readdirSync(SAMPLES_DIR)
@@ -64,7 +64,7 @@ function createMcpServer() {
   // ── Tool: read_sample ───────────────────────────────────────────────────────
   server.tool(
     "read_sample",
-    "Extract the full text from a sample proposal .docx file. Use this to learn the company's writing style, team/org structure presentation, tone, and section format before drafting a new proposal.",
+    "Extract the full text from one of the company's past proposal documents. Use this to learn the company's writing style, tone, team/org structure presentation, and section format before drafting a new proposal. These are NOT RFP documents — they are the company's own previously submitted proposals.",
     { filename: z.string().describe("Filename from list_samples, e.g. Proposal_01_SmartMeterFirmware.docx") },
     async ({ filename }) => {
       const safeName = basename(filename)
