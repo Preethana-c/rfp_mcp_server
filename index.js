@@ -36,6 +36,7 @@ function checkApiKey(req, res) {
   const auth = req.headers.authorization || ""
   const key  = auth.startsWith("Bearer ") ? auth.slice(7) : req.query.api_key
   if (key !== API_KEY) {
+    res.setHeader("WWW-Authenticate", `Bearer resource_metadata="${PUBLIC_URL}/.well-known/oauth-protected-resource"`)
     res.status(401).json({ error: "Invalid API key" })
     return false
   }
@@ -214,6 +215,13 @@ app.use((req, res, next) => {
 
 app.use(express.json())
 app.use(express.urlencoded({ extended: false }))
+
+app.get("/.well-known/oauth-protected-resource", (req, res) => {
+  res.json({
+    resource:               PUBLIC_URL,
+    authorization_servers:  [PUBLIC_URL]
+  })
+})
 
 app.get("/.well-known/oauth-authorization-server", (req, res) => {
   res.json({
