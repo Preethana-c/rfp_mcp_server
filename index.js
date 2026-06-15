@@ -8,7 +8,11 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { join, extname, basename } from "path"
 import { fileURLToPath } from "url"
 import { dirname } from "path"
+import { randomBytes } from "crypto"
 import { z } from "zod"
+
+const oauthClients = new Map()
+const oauthCodes   = new Map()
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -204,6 +208,55 @@ app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, mcp-session-id")
   if (req.method === "OPTIONS") return res.sendStatus(204)
   next()
+})
+
+// ── OAuth fake handshake ──────────────────────────────────────────────────────
+
+app.use(express.json())
+app.use(express.urlencoded({ extended: false }))
+
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  res.json({
+    issuer:                           PUBLIC_URL,
+    authorization_endpoint:           `${PUBLIC_URL}/authorize`,
+    token_endpoint:                   `${PUBLIC_URL}/token`,
+    registration_endpoint:            `${PUBLIC_URL}/register`,
+    response_types_supported:         ["code"],
+    grant_types_supported:            ["authorization_code"],
+    token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"],
+    code_challenge_methods_supported: ["S256", "plain"]
+  })
+})
+
+app.post("/register", (req, res) => {
+  const client_id     = randomBytes(16).toString("hex")
+  const client_secret = randomBytes(32).toString("hex")
+  const redirect_uris = req.body?.redirect_uris || []
+  oauthClients.set(client_id, { client_secret, redirect_uris })
+  res.status(201).json({
+    client_id, client_secret, redirect_uris,
+    grant_types: ["authorization_code"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none"
+  })
+})
+
+app.get("/authorize", (req, res) => {
+  const { redirect_uri, state, code_challenge, code_challenge_method } = req.query
+  const code = randomBytes(32).toString("hex")
+  oauthCodes.set(code, { redirect_uri, code_challenge, code_challenge_method, exp: Date.now() + 600_000 })
+  const url = new URL(redirect_uri)
+  url.searchParams.set("code", code)
+  if (state) url.searchParams.set("state", state)
+  res.redirect(url.toString())
+})
+
+app.post("/token", (req, res) => {
+  const code  = req.body?.code
+  const entry = oauthCodes.get(code)
+  if (!entry || Date.now() > entry.exp) return res.status(400).json({ error: "invalid_grant" })
+  oauthCodes.delete(code)
+  res.json({ access_token: API_KEY, token_type: "Bearer", expires_in: 86400 })
 })
 
 // ── MCP endpoint ──────────────────────────────────────────────────────────────
