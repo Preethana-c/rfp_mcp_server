@@ -106,10 +106,11 @@ function createMcpServer() {
     "Read the company proposal template — returns its full structure including section layout, heading styles, and where the logo/images are placed. Call this before writing any proposal so the output matches the company template exactly, the same way uploading the template in Claude chat would.",
     {},
     async () => {
-      const tmplPath = join(TEMPLATES_DIR, "company-template.docx")
+      const files    = readdirSync(TEMPLATES_DIR).filter(f => extname(f).toLowerCase() === ".docx")
+      const tmplPath = files.length > 0 ? join(TEMPLATES_DIR, files[0]) : null
 
-      if (!existsSync(tmplPath)) {
-        return { content: [{ type: "text", text: "No template found. Upload company-template.docx via POST /upload/template on the MCP server." }] }
+      if (!tmplPath) {
+        return { content: [{ type: "text", text: "No template found in templates directory." }] }
       }
 
       // Convert to HTML — preserves section order, headings, tables, image positions
@@ -162,7 +163,8 @@ function createMcpServer() {
       const safeName  = basename(output_filename).replace(/[^a-z0-9._-]/gi, "_")
       const mdPath    = join(OUTPUT_DIR, "proposal-draft.md")
       const outPath   = join(OUTPUT_DIR, safeName)
-      const tmplPath  = join(TEMPLATES_DIR, "company-template.docx")
+      const tmplFiles = readdirSync(TEMPLATES_DIR).filter(f => extname(f).toLowerCase() === ".docx")
+      const tmplPath  = tmplFiles.length > 0 ? join(TEMPLATES_DIR, tmplFiles[0]) : null
 
       writeFileSync(mdPath, markdown_content, "utf-8")
 
