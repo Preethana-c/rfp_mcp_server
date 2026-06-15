@@ -213,9 +213,6 @@ app.use((req, res, next) => {
 
 // ── OAuth fake handshake ──────────────────────────────────────────────────────
 
-app.use(express.json())
-app.use(express.urlencoded({ extended: false }))
-
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
   res.json({
     resource:               PUBLIC_URL,
@@ -236,7 +233,7 @@ app.get("/.well-known/oauth-authorization-server", (req, res) => {
   })
 })
 
-app.post("/register", (req, res) => {
+app.post("/register", express.json(), express.urlencoded({ extended: false }), (req, res) => {
   const client_id     = randomBytes(16).toString("hex")
   const redirect_uris = (req.body && req.body.redirect_uris) || []
   oauthClients.set(client_id, { redirect_uris })
@@ -274,7 +271,7 @@ app.get("/authorize", (req, res) => {
   res.redirect(url.toString())
 })
 
-app.post("/token", (req, res) => {
+app.post("/token", express.json(), express.urlencoded({ extended: false }), (req, res) => {
   res.json({ access_token: API_KEY, token_type: "Bearer", expires_in: 86400 })
 })
 
