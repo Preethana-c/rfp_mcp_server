@@ -3,13 +3,16 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import express from "express"
 import multer from "multer"
 import mammoth from "mammoth"
-import PizZip from "pizzip"
 import { execSync } from "child_process"
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, copyFileSync } from "fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs"
 import { join, extname, basename } from "path"
 import { fileURLToPath } from "url"
 import { dirname } from "path"
+import { randomBytes } from "crypto"
 import { z } from "zod"
+
+const oauthClients = new Map()
+const oauthCodes   = new Map()
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -21,85 +24,10 @@ const PUBLIC_URL    = process.env.PUBLIC_URL || `http://localhost:${PORT}`
 
 const SAMPLES_DIR   = join(__dirname, "samples")
 const TEMPLATES_DIR = join(__dirname, "templates")
-const OUTPUT_DIR    = join(__dirname, "output")   // app dir, not /tmp — avoids Railway RAM disk limits
+const OUTPUT_DIR    = "/tmp/rfp_output"
 
 for (const dir of [SAMPLES_DIR, TEMPLATES_DIR, OUTPUT_DIR]) {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-}
-
-// ── Header injection ──────────────────────────────────────────────────────────
-// Copies only the header/footer (logo) from the company template into a clean
-// pandoc-generated .docx. This preserves pandoc's clean formatting while
-// adding the company logo — same result as manually uploading the template in chat.
-
-function injectTemplateHeader(cleanDocxBuf, templateBuf) {
-  const cleanZip = new PizZip(cleanDocxBuf)
-  const tmplZip  = new PizZip(templateBuf)
-
-  const tmplRels = tmplZip.file("word/_rels/document.xml.rels")?.asText() || ""
-  const tmplDoc  = tmplZip.file("word/document.xml")?.asText() || ""
-
-  // Find header/footer relationship entries in the template
-  const hfRels = [...tmplRels.matchAll(/<Relationship[^>]+Type="[^"]*\/(header|footer)"[^>]*\/>/g)]
-    .map(m => ({
-      full:   m[0],
-      id:     m[0].match(/Id="([^"]+)"/)?.[1],
-      type:   m[1],
-      target: m[0].match(/Target="([^"]+)"/)?.[1]
-    }))
-    .filter(r => r.id && r.target)
-
-  if (hfRels.length === 0) return cleanDocxBuf  // template has no header/footer
-
-  // Find next safe relationship ID in the clean doc
-  const cleanRels = cleanZip.file("word/_rels/document.xml.rels")?.asText() || ""
-  const usedIds   = [...cleanRels.matchAll(/Id="rId(\d+)"/g)].map(m => parseInt(m[1]))
-  let nextId      = (usedIds.length ? Math.max(...usedIds) : 0) + 1
-
-  // Build ID remap: template IDs → new safe IDs
-  const idMap = {}
-  for (const r of hfRels) idMap[r.id] = `rId${nextId++}`
-
-  // 1. Add remapped rels to clean doc
-  const newRelXml = hfRels.map(r => {
-    const typeUrl = `http://schemas.openxmlformats.org/officeDocument/2006/relationships/${r.type}`
-    return `<Relationship Id="${idMap[r.id]}" Type="${typeUrl}" Target="${r.target}"/>`
-  }).join("\n")
-  cleanZip.file("word/_rels/document.xml.rels",
-    cleanRels.replace("</Relationships>", newRelXml + "\n</Relationships>"))
-
-  // 2. Copy header/footer XML + their rels + media images
-  for (const r of hfRels) {
-    const srcPath = `word/${r.target}`
-    const srcFile = tmplZip.file(srcPath)
-    if (srcFile) cleanZip.file(srcPath, srcFile.asArrayBuffer())
-
-    const hfRelsPath = `word/_rels/${r.target}.rels`
-    const hfRelsFile = tmplZip.file(hfRelsPath)
-    if (hfRelsFile) {
-      cleanZip.file(hfRelsPath, hfRelsFile.asText())
-      for (const [, img] of hfRelsFile.asText().matchAll(/Target="\.\.\/media\/([^"]+)"/g)) {
-        const mPath = `word/media/${img}`
-        const mFile = tmplZip.file(mPath)
-        if (mFile) cleanZip.file(mPath, mFile.asArrayBuffer())
-      }
-    }
-  }
-
-  // 3. Inject header/footer references into clean doc's sectPr
-  const tmplSectPr   = tmplDoc.match(/<w:sectPr[^>]*>([\s\S]*?)<\/w:sectPr>/)?.[1] || ""
-  const hfRefEls     = [...tmplSectPr.matchAll(/<w:(header|footer)Reference[^/]*\/>/g)]
-    .map(m => m[0].replace(/r:id="([^"]+)"/, (_, oid) => `r:id="${idMap[oid] || oid}"`))
-
-  if (hfRefEls.length > 0) {
-    let cleanDoc = cleanZip.file("word/document.xml")?.asText() || ""
-    cleanDoc = cleanDoc.includes("</w:sectPr>")
-      ? cleanDoc.replace("</w:sectPr>", hfRefEls.join("\n") + "\n</w:sectPr>")
-      : cleanDoc.replace("</w:body>", `<w:sectPr>${hfRefEls.join("\n")}</w:sectPr></w:body>`)
-    cleanZip.file("word/document.xml", cleanDoc)
-  }
-
-  return cleanZip.generate({ type: "nodebuffer", compression: "DEFLATE" })
 }
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
@@ -243,48 +171,37 @@ function createMcpServer() {
     async ({ markdown_content, output_filename }) => {
       const safeName  = basename(output_filename).replace(/[^a-z0-9._-]/gi, "_")
       const mdPath    = join(OUTPUT_DIR, "proposal-draft.md")
-      const cleanPath = join(OUTPUT_DIR, "proposal-clean.docx")
       const outPath   = join(OUTPUT_DIR, safeName)
+      const tmplFiles = readdirSync(TEMPLATES_DIR).filter(f => extname(f).toLowerCase() === ".docx")
+      const tmplPath  = tmplFiles.length > 0 ? join(TEMPLATES_DIR, tmplFiles[0]) : null
 
       writeFileSync(mdPath, markdown_content, "utf-8")
 
-      try { execSync("pandoc --version", { stdio: "pipe" }) } catch {
-        return { content: [{ type: "text", text: "pandoc not found on server — redeploy with the Dockerfile (it installs pandoc)." }] }
+      // Check pandoc is available
+      try {
+        execSync("pandoc --version", { stdio: "pipe" })
+      } catch {
+        return { content: [{ type: "text", text: "pandoc is not installed on this server. Add 'RUN apt-get install -y pandoc' to the Dockerfile and redeploy." }] }
       }
 
-      // Step 1: generate clean .docx with no reference-doc — preserves proper formatting
+      const cmd = (tmplPath && existsSync(tmplPath))
+        ? `pandoc "${mdPath}" -o "${outPath}" --reference-doc="${tmplPath}"`
+        : `pandoc "${mdPath}" -o "${outPath}"`
+
       try {
-        execSync(`pandoc "${mdPath}" -o "${cleanPath}"`, { stdio: "pipe" })
+        execSync(cmd, { stdio: "pipe" })
       } catch (err) {
         return { content: [{ type: "text", text: `pandoc failed: ${err.message}` }] }
       }
 
-      // Step 2: inject header/footer (logo) from company template into the clean .docx
-      const tmplFiles = readdirSync(TEMPLATES_DIR).filter(f => extname(f).toLowerCase() === ".docx")
-      let branded = false
-      if (tmplFiles.length > 0) {
-        try {
-          const cleanBuf  = readFileSync(cleanPath)
-          const tmplBuf   = readFileSync(join(TEMPLATES_DIR, tmplFiles[0]))
-          const brandedBuf = injectTemplateHeader(cleanBuf, tmplBuf)
-          writeFileSync(outPath, brandedBuf)
-          branded = true
-        } catch (err) {
-          // Header injection failed — fall back to clean output
-          copyFileSync(cleanPath, outPath)
-          console.error("Header injection failed, using clean output:", err.message)
-        }
-      } else {
-        copyFileSync(cleanPath, outPath)
-      }
-
       const downloadUrl = `${PUBLIC_URL}/download/${safeName}`
-      const note = branded
-        ? `Logo and header from ${tmplFiles[0]} injected — formatting clean, branding applied.`
-        : "No company template found — clean formatting, no logo. Upload company-template.docx to add branding."
+      const usedTemplate = (tmplPath && existsSync(tmplPath)) ? tmplPath.split("/").pop() + " (branded — logo, header, footer preserved)" : "default Word styles (no template found)"
 
       return {
-        content: [{ type: "text", text: `Proposal generated.\n${note}\nDownload: ${downloadUrl}` }]
+        content: [{
+          type: "text",
+          text: `Proposal generated.\nTemplate used: ${usedTemplate}\nDownload: ${downloadUrl}`
+        }]
       }
     }
   )
