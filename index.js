@@ -44,10 +44,69 @@ function checkApiKey(req, res) {
   return true
 }
 
-// ── Template asset injection ──────────────────────────────────────────────────
-// Runs after clean pandoc (no --reference-doc) to copy header, footer, logo
-// images, theme fonts, and page margins from the company template into the
-// pandoc-generated .docx. Gives proper formatting AND the branded logo.
+// ── Build proposal by cloning template ───────────────────────────────────────
+// Starts from the template DOCX (cover page, logo, colored shapes, header,
+// footer, styles all preserved) and replaces the body content after the cover
+// page with the pandoc-generated proposal content.
+
+function buildProposalFromTemplate(pandocDocxPath, tmplPath, outputPath) {
+  const tmplZip   = new AdmZip(tmplPath)
+  const pandocZip = new AdmZip(pandocDocxPath)
+
+  // ── Extract styled body content from pandoc output ───────────────────────
+  const pandocDocXml    = pandocZip.getEntry("word/document.xml").getData().toString("utf-8")
+  const pandocBodyMatch = pandocDocXml.match(/<w:body>([\s\S]*?)<\/w:body>/)
+  if (!pandocBodyMatch) throw new Error("Cannot parse pandoc output body")
+
+  // Strip pandoc's final sectPr — use the template's page setup instead
+  let pandocBody = pandocBodyMatch[1]
+    .replace(/<w:sectPr\b[\s\S]*?<\/w:sectPr>\s*$/, "")
+    .trim()
+
+  // ── Clone template and locate the cover page section ─────────────────────
+  let tmplDocXml     = tmplZip.getEntry("word/document.xml").getData().toString("utf-8")
+  const bodyOpenIdx  = tmplDocXml.indexOf("<w:body>") + "<w:body>".length
+  const bodyCloseIdx = tmplDocXml.lastIndexOf("</w:body>")
+  const tmplBody     = tmplDocXml.substring(bodyOpenIdx, bodyCloseIdx)
+
+  // Cover page ends at the first paragraph-level section break:
+  // a <w:sectPr> nested inside <w:p><w:pPr>
+  const sectBreakMatch = tmplBody.match(/<w:p[ >][\s\S]*?<w:sectPr\b[\s\S]*?<\/w:sectPr>[\s\S]*?<\/w:p>/)
+  const finalSectPr    = (tmplBody.match(/<w:sectPr\b[\s\S]*?<\/w:sectPr>\s*$/) ?? [])[0] ?? ""
+
+  let newBody
+  if (sectBreakMatch) {
+    // Keep cover page (everything up to and including the section break),
+    // then append the pandoc proposal content
+    const coverEnd = tmplBody.indexOf(sectBreakMatch[0]) + sectBreakMatch[0].length
+    newBody = tmplBody.substring(0, coverEnd) + "\n" + pandocBody + "\n" + finalSectPr
+  } else {
+    // No explicit section break — replace body, keep template page setup
+    newBody = pandocBody + "\n" + finalSectPr
+  }
+
+  const newDocXml =
+    tmplDocXml.substring(0, bodyOpenIdx) + "\n" + newBody + "\n" +
+    tmplDocXml.substring(bodyCloseIdx)
+
+  tmplZip.updateFile("word/document.xml", Buffer.from(newDocXml, "utf-8"))
+
+  // ── Copy any inline images from pandoc output ─────────────────────────────
+  for (const entry of pandocZip.getEntries()) {
+    if (entry.entryName.startsWith("word/media/") && !tmplZip.getEntry(entry.entryName)) {
+      tmplZip.addFile(entry.entryName, entry.getData())
+    }
+  }
+
+  // ── Apply table borders ───────────────────────────────────────────────────
+  const merged = tmplZip.getEntry("word/document.xml").getData().toString("utf-8")
+  tmplZip.updateFile("word/document.xml", Buffer.from(_applyTableBordersXml(merged), "utf-8"))
+
+  tmplZip.writeZip(outputPath)
+}
+
+// ── Template asset injection (legacy fallback) ────────────────────────────────
+// Kept as fallback in case buildProposalFromTemplate fails.
 
 const HEADER_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header"
 const FOOTER_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer"
@@ -448,21 +507,27 @@ function createMcpServer() {
         }
       }
 
-      // Inject branded header/footer/logo/theme from template, fix table borders
+      // Clone the template and inject pandoc content after the cover page.
+      // This preserves the cover page logo, colored shapes, header, footer,
+      // and all styles from the template file.
       if (tmplPath && existsSync(tmplPath)) {
         try {
-          injectTemplateAssets(outPath, tmplPath)
+          buildProposalFromTemplate(outPath, tmplPath, outPath)
         } catch (err) {
-          console.error("injectTemplateAssets error:", err.message)
-          // Fall back to just fixing table borders on the clean pandoc output
+          console.error("buildProposalFromTemplate error:", err.message)
+          // Fallback: try legacy header/footer injection
           try {
-            const zip = new AdmZip(outPath)
-            _applyTableBorders(zip)
-            zip.writeZip(outPath)
-          } catch {}
+            injectTemplateAssets(outPath, tmplPath)
+          } catch (err2) {
+            console.error("injectTemplateAssets fallback error:", err2.message)
+            try {
+              const zip = new AdmZip(outPath)
+              _applyTableBorders(zip)
+              zip.writeZip(outPath)
+            } catch {}
+          }
         }
       } else {
-        // No template — still fix table borders on plain output
         try {
           const zip = new AdmZip(outPath)
           _applyTableBorders(zip)
