@@ -86,6 +86,16 @@ function buildProposalFromTemplate(pandocDocxPath, tmplPath, outputPath, coverDa
     .replace(/<w:sectPr\b[\s\S]*?<\/w:sectPr>\s*$/, "")
     .trim()
 
+  // Normalise pandoc's default style names to match the Qmax template's style IDs.
+  // Pandoc without --reference-doc uses "Heading 1" (space); the template uses "Heading1".
+  pandocBody = pandocBody
+    .replace(/w:val="Heading 1"/g,  'w:val="Heading1"')
+    .replace(/w:val="Heading 2"/g,  'w:val="Heading2"')
+    .replace(/w:val="Heading 3"/g,  'w:val="Heading3"')
+    .replace(/w:val="Heading 4"/g,  'w:val="Heading4"')
+    .replace(/w:val="Body Text"/g,  'w:val="Normal"')
+    .replace(/w:val="First Paragraph"/g, 'w:val="Normal"')
+
   // ── Clone template and find the cut point ────────────────────────────────
   let tmplDocXml     = tmplZip.getEntry("word/document.xml").getData().toString("utf-8")
   const bodyOpenIdx  = tmplDocXml.indexOf("<w:body>") + "<w:body>".length
@@ -451,61 +461,48 @@ function createMcpServer() {
   )
 
   // ── Tool: read_template ─────────────────────────────────────────────────────
-  // This is what replaces the "manually upload template in chat" step.
-  // Mammoth converts the .docx to HTML, which preserves structure, section order,
-  // heading hierarchy, table layouts, and notes where images/logos are placed.
-  // Claude reads this exactly like it would read an uploaded template in chat.
+  // Returns the template_structure.md file (clean section skeleton) so Claude
+  // knows exactly what sections, heading levels, and table columns to write.
+  // The .docx template is used separately for visual generation (logo, header,
+  // footer, cover page, styles) — Claude never needs to read the .docx directly.
   server.tool(
     "read_template",
-    "Read the company proposal template — returns its full structure including section layout, heading styles, and where the logo/images are placed. Call this before writing any proposal so the output matches the company template exactly, the same way uploading the template in Claude chat would.",
+    "Read the Qmax proposal template structure — returns every section name, heading level, and table column layout Claude must follow when writing a proposal. Call this first before writing anything.",
     {},
     async () => {
-      const files    = readdirSync(TEMPLATES_DIR).filter(f => extname(f).toLowerCase() === ".docx")
-      const tmplPath = files.length > 0 ? join(TEMPLATES_DIR, files[0]) : null
+      const mdPath   = join(TEMPLATES_DIR, "template_structure.md")
+      const docxFiles = readdirSync(TEMPLATES_DIR).filter(f => extname(f).toLowerCase() === ".docx")
 
-      if (!tmplPath) {
-        return { content: [{ type: "text", text: "No template found in templates directory." }] }
+      if (!existsSync(mdPath) && docxFiles.length === 0) {
+        return { content: [{ type: "text", text: "No template found. Upload template_structure.md and/or a .docx template." }] }
       }
 
-      // Convert to HTML — preserves section order, headings, tables, image positions
-      const result = await mammoth.convertToHtml({ path: tmplPath })
+      // Prefer the clean markdown structure file
+      if (existsSync(mdPath)) {
+        const mdContent = readFileSync(mdPath, "utf-8")
+        const output = [
+          "=== QMAX PROPOSAL TEMPLATE ===",
+          "",
+          "RULES — follow these exactly:",
+          "1. Write a YAML frontmatter block FIRST (see template below for the fields)",
+          "2. Use # for main sections (Heading1 style), ## for subsections (Heading2), ### for sub-subsections",
+          "3. Use the EXACT section names below — character for character, including numbers",
+          "4. Use | table | markdown syntax — exact column headers as shown below",
+          "5. Do NOT write a document title heading — cover page comes from frontmatter",
+          "6. Do NOT write a Table of Contents — the Word template has one that auto-updates",
+          "7. Fill EVERY field — zero placeholders, zero generic sentences",
+          "",
+          "=== TEMPLATE STRUCTURE (copy this skeleton, fill in real content) ===",
+          "",
+          mdContent
+        ].join("\n")
+        return { content: [{ type: "text", text: output }] }
+      }
 
-      // Also get plain text for a readable summary
+      // Fallback: extract text from .docx
+      const tmplPath  = join(TEMPLATES_DIR, docxFiles[0])
       const textResult = await mammoth.extractRawText({ path: tmplPath })
-
-      const output = [
-        "=== COMPANY TEMPLATE STRUCTURE ===",
-        `Template file: ${files[0]}`,
-        "",
-        "MANDATORY MARKDOWN FORMAT FOR generate_proposal_docx:",
-        "",
-        "1. START with a YAML frontmatter block (required for cover page substitution):",
-        "---",
-        "title: \"Your project title here\"",
-        "client: \"Client company name\"",
-        "nature: \"Brief description of what is being built\"",
-        "doc_number: \"QMX-PRO-2026-XXX-001\"",
-        "date: \"Month DD, YYYY\"",
-        "---",
-        "",
-        "2. HEADING LEVELS — match what the template uses:",
-        "   - # (Heading 1) for top-level sections: Abbreviations & Acronyms, 1. Executive Summary, 2. Project Understanding, etc.",
-        "   - ## (Heading 2) for subsections: 2.1 Requirements Compliance Matrix, 3.1 System Block Diagram, etc.",
-        "   - ### (Heading 3) for sub-subsections",
-        "   - DO NOT add a # document title — the cover page comes from the template + frontmatter",
-        "",
-        "3. USE EXACT HEADING TEXT from the template (character for character, including numbers)",
-        "4. Use | table | markdown syntax for all tables",
-        "5. Do NOT include a Table of Contents — the template already has one that auto-updates in Word",
-        "",
-        "--- Template HTML structure (section order, heading hierarchy, table layouts) ---",
-        result.value,
-        "",
-        "--- Template plain text (readable content summary) ---",
-        textResult.value.trim()
-      ].join("\n")
-
-      return { content: [{ type: "text", text: output }] }
+      return { content: [{ type: "text", text: textResult.value.trim() }] }
     }
   )
 
