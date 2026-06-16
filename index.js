@@ -44,6 +44,221 @@ function checkApiKey(req, res) {
   return true
 }
 
+// ── Template asset injection ──────────────────────────────────────────────────
+// Runs after clean pandoc (no --reference-doc) to copy header, footer, logo
+// images, theme fonts, and page margins from the company template into the
+// pandoc-generated .docx. Gives proper formatting AND the branded logo.
+
+const HEADER_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header"
+const FOOTER_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer"
+const HEADER_CT  = "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"
+const FOOTER_CT  = "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"
+
+function injectTemplateAssets(generatedPath, templatePath) {
+  const genZip  = new AdmZip(generatedPath)
+  const tmplZip = new AdmZip(templatePath)
+
+  // Index all template entries for O(1) lookup
+  const tmpl = new Map()
+  tmplZip.getEntries().forEach(e => tmpl.set(e.entryName, e))
+
+  // ── Parse template document relationships ────────────────────────────────
+  const tmplDocRels = tmpl.get("word/_rels/document.xml.rels")?.getData().toString("utf-8") ?? ""
+  const tmplDocXml  = tmpl.get("word/document.xml")?.getData().toString("utf-8") ?? ""
+
+  // Collect header/footer relationship nodes from template
+  const hfRelNodes = []
+  for (const m of tmplDocRels.matchAll(/<Relationship\b([^>]*)\/>/g)) {
+    if (/\/(header|footer)"/.test(m[1])) hfRelNodes.push(m[1])
+  }
+  if (hfRelNodes.length === 0) {
+    // Template has no header/footer — still fix table borders
+    _applyTableBorders(genZip)
+    genZip.writeZip(generatedPath)
+    return
+  }
+
+  // Build old-rId → { newId, target } map  (use rId200+ to avoid pandoc conflicts)
+  const docIdMap = new Map()
+  let nextDocId = 200
+  for (const attrs of hfRelNodes) {
+    const oldId  = attrs.match(/\bId="([^"]+)"/)?.[1]
+    const target = attrs.match(/\bTarget="([^"]+)"/)?.[1]
+    if (oldId && target) docIdMap.set(oldId, { newId: `rId${nextDocId++}`, target })
+  }
+
+  // Map old header/footer rIds → their w:type (default / first / even)
+  // from the template's sectPr
+  const hfTypeMap = new Map()
+  for (const rx of [
+    /<w:(header|footer)Reference\s+w:type="([^"]+)"\s+r:id="([^"]+)"/g,
+    /<w:(header|footer)Reference\s+r:id="([^"]+)"\s+w:type="([^"]+)"/g,
+  ]) {
+    for (const m of tmplDocXml.matchAll(rx)) {
+      const [, tag, a, b] = m
+      const [wType, rId] = rx.source.startsWith(/<w/)
+        ? [a, b]   // type first
+        : [b, a]   // rId first
+      if (!hfTypeMap.has(rId)) hfTypeMap.set(rId, { tagName: tag, type: wType })
+    }
+  }
+  // Simpler fallback parse that works regardless of attribute order
+  for (const m of tmplDocXml.matchAll(/<w:(header|footer)Reference\b([^/]*)\//g)) {
+    const tag   = m[1]
+    const attrs = m[2]
+    const rId   = attrs.match(/r:id="([^"]+)"/)?.[1]
+    const type  = attrs.match(/w:type="([^"]+)"/)?.[1]
+    if (rId && type && !hfTypeMap.has(rId)) hfTypeMap.set(rId, { tagName: tag, type })
+  }
+
+  // ── Process each header/footer file ─────────────────────────────────────
+  const mediaToAdd = new Map()   // destPath → Buffer
+  let nextImgId = 300
+
+  for (const [oldId, { newId, target }] of docIdMap) {
+    const hfPath     = `word/${target}`
+    const hfName     = target.split("/").pop()
+    const hfRelsPath = `word/_rels/${hfName}.rels`
+
+    let hfXml = tmpl.get(hfPath)?.getData().toString("utf-8")
+    if (!hfXml) continue
+
+    // Process image/media references inside this header/footer
+    const hfRelsRaw = tmpl.get(hfRelsPath)?.getData().toString("utf-8") ?? ""
+    const imgIdMap  = new Map()  // old img rId → new img rId
+
+    if (hfRelsRaw) {
+      let newHfRels =
+        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n` +
+        `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n`
+
+      for (const m of hfRelsRaw.matchAll(/<Relationship\b([^>]*)\/>/g)) {
+        const a        = m[1]
+        const imgOld   = a.match(/\bId="([^"]+)"/)?.[1]
+        const imgTgt   = a.match(/\bTarget="([^"]+)"/)?.[1]
+        const imgType  = a.match(/\bType="([^"]+)"/)?.[1]
+        if (!imgOld || !imgTgt || !imgType) continue
+
+        const imgNew    = `rId${nextImgId++}`
+        const imgFname  = imgTgt.split("/").pop()
+        const newTarget = `media/tpl_${imgFname}`
+
+        imgIdMap.set(imgOld, imgNew)
+
+        // Copy image buffer from template (try multiple path forms)
+        const imgBuf = tmpl.get(`word/${imgTgt}`)?.getData()
+                    ?? tmpl.get(`word/media/${imgFname}`)?.getData()
+        if (imgBuf) mediaToAdd.set(`word/${newTarget}`, imgBuf)
+
+        newHfRels += `  <Relationship Id="${imgNew}" Type="${imgType}" Target="${newTarget}"/>\n`
+      }
+      newHfRels += `</Relationships>`
+      genZip.addFile(hfRelsPath, Buffer.from(newHfRels, "utf-8"))
+
+      // Remap image IDs inside header/footer XML
+      for (const [imgOld, imgNew] of imgIdMap) {
+        hfXml = hfXml
+          .replaceAll(`r:id="${imgOld}"`,    `r:id="${imgNew}"`)
+          .replaceAll(`r:embed="${imgOld}"`, `r:embed="${imgNew}"`)
+      }
+    }
+
+    genZip.addFile(hfPath, Buffer.from(hfXml, "utf-8"))
+  }
+
+  // ── Add media files ──────────────────────────────────────────────────────
+  for (const [path, buf] of mediaToAdd) genZip.addFile(path, buf)
+
+  // ── Copy theme (fonts and colours) from template ─────────────────────────
+  const themeBuf = tmpl.get("word/theme/theme1.xml")?.getData()
+  if (themeBuf) {
+    if (genZip.getEntry("word/theme/theme1.xml"))
+      genZip.updateFile("word/theme/theme1.xml", themeBuf)
+    else
+      genZip.addFile("word/theme/theme1.xml", themeBuf)
+  }
+
+  // ── Update [Content_Types].xml ───────────────────────────────────────────
+  let ctXml = genZip.getEntry("[Content_Types].xml")?.getData().toString("utf-8") ?? ""
+  for (const { target } of docIdMap.values()) {
+    const ct       = target.includes("header") ? HEADER_CT : FOOTER_CT
+    const partName = `/word/${target}`
+    if (!ctXml.includes(partName))
+      ctXml = ctXml.replace("</Types>", `  <Override PartName="${partName}" ContentType="${ct}"/>\n</Types>`)
+  }
+  genZip.updateFile("[Content_Types].xml", Buffer.from(ctXml, "utf-8"))
+
+  // ── Update word/_rels/document.xml.rels ─────────────────────────────────
+  const newRelLines = []
+  for (const [, { newId, target }] of docIdMap) {
+    const relType = target.includes("header") ? HEADER_REL : FOOTER_REL
+    newRelLines.push(`  <Relationship Id="${newId}" Type="${relType}" Target="${target}"/>`)
+  }
+  let genDocRels = genZip.getEntry("word/_rels/document.xml.rels")?.getData().toString("utf-8") ?? ""
+  genDocRels = genDocRels.replace("</Relationships>", newRelLines.join("\n") + "\n</Relationships>")
+  genZip.updateFile("word/_rels/document.xml.rels", Buffer.from(genDocRels, "utf-8"))
+
+  // ── Update document.xml sectPr ───────────────────────────────────────────
+  let docXml = genZip.getEntry("word/document.xml")?.getData().toString("utf-8") ?? ""
+
+  // Strip old references
+  docXml = docXml
+    .replace(/<w:headerReference[^/]*\/>/g, "")
+    .replace(/<w:footerReference[^/]*\/>/g, "")
+    .replace(/<w:titlePg\/>/g, "")
+
+  // Build new headerReference / footerReference elements
+  const hfElems = []
+  for (const [oldId, { newId, target }] of docIdMap) {
+    const info = hfTypeMap.get(oldId) ?? {
+      tagName: target.includes("header") ? "header" : "footer",
+      type: "default"
+    }
+    hfElems.push(`  <w:${info.tagName}Reference w:type="${info.type}" r:id="${newId}"/>`)
+  }
+  if ([...hfTypeMap.values()].some(v => v.type === "first")) hfElems.push("  <w:titlePg/>")
+
+  // Copy page size and margins from template
+  const tmplPgSz  = tmplDocXml.match(/<w:pgSz\b[^/]*\/>/)?.[0]  ?? ""
+  const tmplPgMar = tmplDocXml.match(/<w:pgMar\b[^/]*\/>/)?.[0] ?? ""
+  docXml = docXml.replace(/<w:pgSz\b[^/]*\/>/g, "").replace(/<w:pgMar\b[^/]*\/>/g, "")
+
+  const sectPrInsert = [...hfElems, tmplPgSz, tmplPgMar].filter(Boolean).join("\n")
+  if (docXml.includes("</w:sectPr>")) {
+    docXml = docXml.replace("</w:sectPr>", sectPrInsert + "\n</w:sectPr>")
+  } else {
+    docXml = docXml.replace("</w:body>", `<w:sectPr>\n${sectPrInsert}\n</w:sectPr>\n</w:body>`)
+  }
+
+  // ── Fix table borders (inline) ───────────────────────────────────────────
+  docXml = _applyTableBordersXml(docXml)
+
+  genZip.updateFile("word/document.xml", Buffer.from(docXml, "utf-8"))
+  genZip.writeZip(generatedPath)
+}
+
+function _applyTableBordersXml(xml) {
+  const borders =
+    "<w:tblBorders>" +
+    '<w:top    w:val="single" w:sz="6" w:space="0" w:color="404040"/>' +
+    '<w:left   w:val="single" w:sz="6" w:space="0" w:color="404040"/>' +
+    '<w:bottom w:val="single" w:sz="6" w:space="0" w:color="404040"/>' +
+    '<w:right  w:val="single" w:sz="6" w:space="0" w:color="404040"/>' +
+    '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="404040"/>' +
+    '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="404040"/>' +
+    "</w:tblBorders>"
+  return xml
+    .replace(/<w:tblBorders>[\s\S]*?<\/w:tblBorders>/g, "")
+    .replace(/<w:tblPr>/g, "<w:tblPr>" + borders)
+}
+
+function _applyTableBorders(zip) {
+  const entry = zip.getEntry("word/document.xml")
+  if (!entry) return
+  const patched = _applyTableBordersXml(entry.getData().toString("utf-8"))
+  zip.updateFile("word/document.xml", Buffer.from(patched, "utf-8"))
+}
+
 // ── MCP server factory ────────────────────────────────────────────────────────
 // One McpServer instance per request (stateless HTTP transport pattern)
 
@@ -178,68 +393,48 @@ function createMcpServer() {
 
       writeFileSync(mdPath, markdown_content, "utf-8")
 
-      // Check pandoc is available
-      try {
-        execSync("pandoc --version", { stdio: "pipe" })
-      } catch {
-        return { content: [{ type: "text", text: "pandoc is not installed on this server. Add 'RUN apt-get install -y pandoc' to the Dockerfile and redeploy." }] }
+      try { execSync("pandoc --version", { stdio: "pipe" }) } catch {
+        return { content: [{ type: "text", text: "pandoc is not installed on this server." }] }
       }
 
-      const cmd = (tmplPath && existsSync(tmplPath))
-        ? `pandoc "${mdPath}" -o "${outPath}" --reference-doc="${tmplPath}"`
-        : `pandoc "${mdPath}" -o "${outPath}"`
-
+      // Always run pandoc WITHOUT --reference-doc so formatting is clean and
+      // consistent. Header/footer/logo/theme are injected afterwards by
+      // injectTemplateAssets, which reads them directly from the template XML.
       try {
-        execSync(cmd, { stdio: "pipe" })
+        execSync(`pandoc "${mdPath}" -o "${outPath}"`, { stdio: "pipe" })
       } catch (err) {
         return { content: [{ type: "text", text: `pandoc failed: ${err.message}` }] }
       }
 
-      // ── Post-process: fix table borders and spacing ────────────────────────────
-      // The reference-doc template may have invisible table borders (white on white).
-      // We patch word/document.xml directly inside the .docx ZIP to force visible borders.
-      try {
-        const zip = new AdmZip(outPath)
-        const docEntry = zip.getEntry("word/document.xml")
-
-        if (docEntry) {
-          let xml = docEntry.getData().toString("utf-8")
-
-          // Strip any border definitions copied from the template (often invisible/white)
-          xml = xml.replace(/<w:tblBorders>[\s\S]*?<\/w:tblBorders>/g, "")
-
-          // Inject clean visible borders on every table
-          const borders =
-            "<w:tblBorders>" +
-            '<w:top    w:val="single" w:sz="6" w:space="0" w:color="404040"/>' +
-            '<w:left   w:val="single" w:sz="6" w:space="0" w:color="404040"/>' +
-            '<w:bottom w:val="single" w:sz="6" w:space="0" w:color="404040"/>' +
-            '<w:right  w:val="single" w:sz="6" w:space="0" w:color="404040"/>' +
-            '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="404040"/>' +
-            '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="404040"/>' +
-            "</w:tblBorders>"
-
-          xml = xml.replace(/<w:tblPr>/g, "<w:tblPr>" + borders)
-
-          // Fix spacing: collapse runs of 3+ consecutive empty paragraphs to 1
-          xml = xml.replace(/(<w:p\s*\/>){3,}/g, "<w:p/>")
-          xml = xml.replace(/(<w:p><\/w:p>){3,}/g, "<w:p></w:p>")
-
-          zip.updateFile("word/document.xml", Buffer.from(xml, "utf-8"))
-          zip.writeZip(outPath)
+      // Inject branded header/footer/logo/theme from template, fix table borders
+      if (tmplPath && existsSync(tmplPath)) {
+        try {
+          injectTemplateAssets(outPath, tmplPath)
+        } catch (err) {
+          console.error("injectTemplateAssets error:", err.message)
+          // Fall back to just fixing table borders on the clean pandoc output
+          try {
+            const zip = new AdmZip(outPath)
+            _applyTableBorders(zip)
+            zip.writeZip(outPath)
+          } catch {}
         }
-      } catch (patchErr) {
-        console.error("Post-process warning (non-fatal):", patchErr.message)
+      } else {
+        // No template — still fix table borders on plain output
+        try {
+          const zip = new AdmZip(outPath)
+          _applyTableBorders(zip)
+          zip.writeZip(outPath)
+        } catch {}
       }
-      // ──────────────────────────────────────────────────────────────────────────
 
-      const downloadUrl = `${PUBLIC_URL}/download/${safeName}`
-      const usedTemplate = (tmplPath && existsSync(tmplPath)) ? tmplPath.split("/").pop() + " (branded — logo, header, footer preserved)" : "default Word styles (no template found)"
+      const downloadUrl   = `${PUBLIC_URL}/download/${safeName}`
+      const templateLabel = tmplPath ? tmplPath.split("/").pop() : "none"
 
       return {
         content: [{
           type: "text",
-          text: `Proposal generated.\nTemplate used: ${usedTemplate}\nDownload: ${downloadUrl}`
+          text: `Proposal .docx generated.\nTemplate: ${templateLabel}\nDownload: ${downloadUrl}`
         }]
       }
     }
