@@ -178,6 +178,35 @@ function injectTemplateAssets(generatedPath, templatePath) {
       genZip.addFile("word/theme/theme1.xml", themeBuf)
   }
 
+  // ── Copy styles (heading, paragraph, table, character styles) ─────────────
+  // This ensures body text, headings, and tables use the template's exact
+  // fonts, colors, and sizes — not pandoc defaults.
+  const stylesBuf = tmpl.get("word/styles.xml")?.getData()
+  if (stylesBuf) {
+    if (genZip.getEntry("word/styles.xml"))
+      genZip.updateFile("word/styles.xml", stylesBuf)
+    else
+      genZip.addFile("word/styles.xml", stylesBuf)
+  }
+
+  // ── Copy numbering (list bullet/indent styles) ────────────────────────────
+  const numBuf = tmpl.get("word/numbering.xml")?.getData()
+  if (numBuf) {
+    if (genZip.getEntry("word/numbering.xml"))
+      genZip.updateFile("word/numbering.xml", numBuf)
+    else
+      genZip.addFile("word/numbering.xml", numBuf)
+  }
+
+  // ── Copy font table (embedded font references) ────────────────────────────
+  const fontBuf = tmpl.get("word/fontTable.xml")?.getData()
+  if (fontBuf) {
+    if (genZip.getEntry("word/fontTable.xml"))
+      genZip.updateFile("word/fontTable.xml", fontBuf)
+    else
+      genZip.addFile("word/fontTable.xml", fontBuf)
+  }
+
   // ── Update [Content_Types].xml ───────────────────────────────────────────
   let ctXml = genZip.getEntry("[Content_Types].xml")?.getData().toString("utf-8") ?? ""
   for (const { target } of docIdMap.values()) {
@@ -397,13 +426,26 @@ function createMcpServer() {
         return { content: [{ type: "text", text: "pandoc is not installed on this server." }] }
       }
 
-      // Always run pandoc WITHOUT --reference-doc so formatting is clean and
-      // consistent. Header/footer/logo/theme are injected afterwards by
-      // injectTemplateAssets, which reads them directly from the template XML.
+      // Run pandoc with --reference-doc so the template's heading styles, fonts,
+      // colors, and paragraph styles are applied directly during conversion.
+      // Fall back to plain pandoc if --reference-doc fails (e.g. complex template).
+      const pandocCmd = tmplPath && existsSync(tmplPath)
+        ? `pandoc "${mdPath}" --reference-doc="${tmplPath}" -o "${outPath}"`
+        : `pandoc "${mdPath}" -o "${outPath}"`
+
       try {
-        execSync(`pandoc "${mdPath}" -o "${outPath}"`, { stdio: "pipe" })
+        execSync(pandocCmd, { stdio: "pipe" })
       } catch (err) {
-        return { content: [{ type: "text", text: `pandoc failed: ${err.message}` }] }
+        if (tmplPath) {
+          // --reference-doc failed — retry without it
+          try {
+            execSync(`pandoc "${mdPath}" -o "${outPath}"`, { stdio: "pipe" })
+          } catch (err2) {
+            return { content: [{ type: "text", text: `pandoc failed: ${err2.message}` }] }
+          }
+        } else {
+          return { content: [{ type: "text", text: `pandoc failed: ${err.message}` }] }
+        }
       }
 
       // Inject branded header/footer/logo/theme from template, fix table borders
