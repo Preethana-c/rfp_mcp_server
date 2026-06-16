@@ -44,54 +44,104 @@ function checkApiKey(req, res) {
   return true
 }
 
-// ── Build proposal by cloning template ───────────────────────────────────────
-// Starts from the template DOCX (cover page, logo, colored shapes, header,
-// footer, styles all preserved) and replaces the body content after the cover
-// page with the pandoc-generated proposal content.
+// ── XML helper ────────────────────────────────────────────────────────────────
 
-function buildProposalFromTemplate(pandocDocxPath, tmplPath, outputPath) {
+function xmlEscape(str) {
+  return (str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;")
+}
+
+// ── YAML frontmatter parser ───────────────────────────────────────────────────
+
+function parseFrontmatter(markdown) {
+  const m = markdown.match(/^---\s*\r?\n([\s\S]*?)\r?\n---/)
+  if (!m) return {}
+  const data = {}
+  for (const line of m[1].split(/\r?\n/)) {
+    const kv = line.match(/^(\w+):\s*["']?(.*?)["']?\s*$/)
+    if (kv) data[kv[1]] = kv[2].trim()
+  }
+  return data
+}
+
+// ── Build proposal by cloning template ───────────────────────────────────────
+// Strategy: keep the template's cover page + TOC (everything before the first
+// Heading1/Heading2 paragraph), replace all section content with the
+// pandoc-generated proposal, and substitute cover page placeholder text.
+// This preserves the logo, colored shapes, header, footer, and styles exactly.
+
+function buildProposalFromTemplate(pandocDocxPath, tmplPath, outputPath, coverData = {}) {
   const tmplZip   = new AdmZip(tmplPath)
   const pandocZip = new AdmZip(pandocDocxPath)
 
-  // ── Extract styled body content from pandoc output ───────────────────────
+  // ── Extract pandoc body (strip pandoc's final sectPr) ────────────────────
   const pandocDocXml    = pandocZip.getEntry("word/document.xml").getData().toString("utf-8")
   const pandocBodyMatch = pandocDocXml.match(/<w:body>([\s\S]*?)<\/w:body>/)
   if (!pandocBodyMatch) throw new Error("Cannot parse pandoc output body")
-
-  // Strip pandoc's final sectPr — use the template's page setup instead
   let pandocBody = pandocBodyMatch[1]
     .replace(/<w:sectPr\b[\s\S]*?<\/w:sectPr>\s*$/, "")
     .trim()
 
-  // ── Clone template and locate the cover page section ─────────────────────
+  // ── Clone template and find the cut point ────────────────────────────────
   let tmplDocXml     = tmplZip.getEntry("word/document.xml").getData().toString("utf-8")
   const bodyOpenIdx  = tmplDocXml.indexOf("<w:body>") + "<w:body>".length
   const bodyCloseIdx = tmplDocXml.lastIndexOf("</w:body>")
   const tmplBody     = tmplDocXml.substring(bodyOpenIdx, bodyCloseIdx)
+  const finalSectPr  = (tmplBody.match(/<w:sectPr\b[\s\S]*?<\/w:sectPr>\s*$/) ?? [])[0] ?? ""
 
-  // Cover page ends at the first paragraph-level section break:
-  // a <w:sectPr> nested inside <w:p><w:pPr>
-  const sectBreakMatch = tmplBody.match(/<w:p[ >][\s\S]*?<w:sectPr\b[\s\S]*?<\/w:sectPr>[\s\S]*?<\/w:p>/)
-  const finalSectPr    = (tmplBody.match(/<w:sectPr\b[\s\S]*?<\/w:sectPr>\s*$/) ?? [])[0] ?? ""
+  // The cover page + TOC section ends just before the first Heading1/Heading2
+  // paragraph in the template. Find that style reference, then look backwards
+  // to the enclosing <w:p> opening tag — that is the cut point.
+  const firstH1Idx  = tmplBody.indexOf('<w:pStyle w:val="Heading1"')
+  const firstH2Idx  = tmplBody.indexOf('<w:pStyle w:val="Heading2"')
+  let firstHdgIdx   = -1
+  if (firstH1Idx !== -1 && firstH2Idx !== -1) firstHdgIdx = Math.min(firstH1Idx, firstH2Idx)
+  else if (firstH1Idx !== -1) firstHdgIdx = firstH1Idx
+  else if (firstH2Idx !== -1) firstHdgIdx = firstH2Idx
 
-  let newBody
-  if (sectBreakMatch) {
-    // Keep cover page (everything up to and including the section break),
-    // then append the pandoc proposal content
-    const coverEnd = tmplBody.indexOf(sectBreakMatch[0]) + sectBreakMatch[0].length
-    newBody = tmplBody.substring(0, coverEnd) + "\n" + pandocBody + "\n" + finalSectPr
-  } else {
-    // No explicit section break — replace body, keep template page setup
-    newBody = pandocBody + "\n" + finalSectPr
+  let coverEndIdx = 0
+  if (firstHdgIdx !== -1) {
+    const before = tmplBody.substring(0, firstHdgIdx)
+    let pIdx = before.lastIndexOf("<w:p ")
+    if (pIdx === -1) pIdx = before.lastIndexOf("<w:p>")
+    if (pIdx !== -1) coverEndIdx = pIdx
   }
 
+  // ── Apply cover page text substitutions ──────────────────────────────────
+  let coverAndToc = tmplBody.substring(0, coverEndIdx)
+
+  if (coverData.title) {
+    coverAndToc = coverAndToc.replace(/Project Title/g, xmlEscape(coverData.title))
+  }
+  if (coverData.nature) {
+    coverAndToc = coverAndToc.replace(/\(Project Nature description\)/g, xmlEscape(coverData.nature))
+  }
+  if (coverData.client) {
+    const cXml = xmlEscape(coverData.client)
+    coverAndToc = coverAndToc.replace(/Customer name/g, cXml)
+    coverAndToc = coverAndToc.replace(/Customer Name/g, cXml)
+  }
+  if (coverData.docNumber) {
+    coverAndToc = coverAndToc.replace(/QMX-PRO-2026-SLMK-001/g, xmlEscape(coverData.docNumber))
+  }
+  if (coverData.date) {
+    coverAndToc = coverAndToc.replace(/June 10, 2026/g, xmlEscape(coverData.date))
+  }
+
+  // ── Assemble: cover+TOC  +  pandoc content  +  template page settings ────
+  const newBody   = coverAndToc + "\n" + pandocBody + "\n" + finalSectPr
   const newDocXml =
-    tmplDocXml.substring(0, bodyOpenIdx) + "\n" + newBody + "\n" +
+    tmplDocXml.substring(0, bodyOpenIdx) + "\n" +
+    newBody + "\n" +
     tmplDocXml.substring(bodyCloseIdx)
 
   tmplZip.updateFile("word/document.xml", Buffer.from(newDocXml, "utf-8"))
 
-  // ── Copy any inline images from pandoc output ─────────────────────────────
+  // ── Copy pandoc inline images (charts, embedded pics from markdown) ───────
   for (const entry of pandocZip.getEntries()) {
     if (entry.entryName.startsWith("word/media/") && !tmplZip.getEntry(entry.entryName)) {
       tmplZip.addFile(entry.entryName, entry.getData())
@@ -427,14 +477,26 @@ function createMcpServer() {
         "=== COMPANY TEMPLATE STRUCTURE ===",
         `Template file: ${files[0]}`,
         "",
-        "FORMATTING RULES — apply exactly when writing markdown for this template:",
-        "- Use # for the proposal title (maps to Heading 1)",
-        "- Use ## for main section headings (maps to Heading 2)",
-        "- Use ### for sub-sections (maps to Heading 3)",
-        "- Use regular paragraphs for body text (maps to Normal style)",
-        "- Use | table | syntax for any tables",
-        "- Do NOT add extra blank lines between heading and first paragraph — this affects spacing in Word",
-        "- Page alignment, fonts, logo, header, footer come from the template automatically via pandoc",
+        "MANDATORY MARKDOWN FORMAT FOR generate_proposal_docx:",
+        "",
+        "1. START with a YAML frontmatter block (required for cover page substitution):",
+        "---",
+        "title: \"Your project title here\"",
+        "client: \"Client company name\"",
+        "nature: \"Brief description of what is being built\"",
+        "doc_number: \"QMX-PRO-2026-XXX-001\"",
+        "date: \"Month DD, YYYY\"",
+        "---",
+        "",
+        "2. HEADING LEVELS — match what the template uses:",
+        "   - # (Heading 1) for top-level sections: Abbreviations & Acronyms, 1. Executive Summary, 2. Project Understanding, etc.",
+        "   - ## (Heading 2) for subsections: 2.1 Requirements Compliance Matrix, 3.1 System Block Diagram, etc.",
+        "   - ### (Heading 3) for sub-subsections",
+        "   - DO NOT add a # document title — the cover page comes from the template + frontmatter",
+        "",
+        "3. USE EXACT HEADING TEXT from the template (character for character, including numbers)",
+        "4. Use | table | markdown syntax for all tables",
+        "5. Do NOT include a Table of Contents — the template already has one that auto-updates in Word",
         "",
         "--- Template HTML structure (section order, heading hierarchy, table layouts) ---",
         result.value,
@@ -474,20 +536,23 @@ function createMcpServer() {
     },
     async ({ markdown_content, output_filename }) => {
       const safeName  = basename(output_filename).replace(/[^a-z0-9._-]/gi, "_")
-      const mdPath    = join(OUTPUT_DIR, "proposal-draft.md")
-      const outPath   = join(OUTPUT_DIR, safeName)
       const tmplFiles = readdirSync(TEMPLATES_DIR).filter(f => extname(f).toLowerCase() === ".docx")
       const tmplPath  = tmplFiles.length > 0 ? join(TEMPLATES_DIR, tmplFiles[0]) : null
 
-      writeFileSync(mdPath, markdown_content, "utf-8")
+      // Parse YAML frontmatter (cover page data) and strip it before pandoc
+      const coverData = parseFrontmatter(markdown_content)
+      const mdForPandoc = markdown_content.replace(/^---\s*\r?\n[\s\S]*?\r?\n---\s*\r?\n/, "")
+
+      const mdPath  = join(OUTPUT_DIR, "proposal-draft.md")
+      const outPath = join(OUTPUT_DIR, safeName)
+      writeFileSync(mdPath, mdForPandoc, "utf-8")
 
       try { execSync("pandoc --version", { stdio: "pipe" }) } catch {
         return { content: [{ type: "text", text: "pandoc is not installed on this server." }] }
       }
 
-      // Run pandoc with --reference-doc so the template's heading styles, fonts,
-      // colors, and paragraph styles are applied directly during conversion.
-      // Fall back to plain pandoc if --reference-doc fails (e.g. complex template).
+      // Pandoc with --reference-doc copies the template's heading styles, fonts,
+      // colors, and paragraph styles into the output DOCX.
       const pandocCmd = tmplPath && existsSync(tmplPath)
         ? `pandoc "${mdPath}" --reference-doc="${tmplPath}" -o "${outPath}"`
         : `pandoc "${mdPath}" -o "${outPath}"`
@@ -496,7 +561,6 @@ function createMcpServer() {
         execSync(pandocCmd, { stdio: "pipe" })
       } catch (err) {
         if (tmplPath) {
-          // --reference-doc failed — retry without it
           try {
             execSync(`pandoc "${mdPath}" -o "${outPath}"`, { stdio: "pipe" })
           } catch (err2) {
@@ -507,15 +571,13 @@ function createMcpServer() {
         }
       }
 
-      // Clone the template and inject pandoc content after the cover page.
-      // This preserves the cover page logo, colored shapes, header, footer,
-      // and all styles from the template file.
+      // Clone the template, keep cover page + TOC, replace section content
+      // with pandoc-generated proposal, substitute cover page placeholders.
       if (tmplPath && existsSync(tmplPath)) {
         try {
-          buildProposalFromTemplate(outPath, tmplPath, outPath)
+          buildProposalFromTemplate(outPath, tmplPath, outPath, coverData)
         } catch (err) {
           console.error("buildProposalFromTemplate error:", err.message)
-          // Fallback: try legacy header/footer injection
           try {
             injectTemplateAssets(outPath, tmplPath)
           } catch (err2) {
