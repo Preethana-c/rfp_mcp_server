@@ -133,16 +133,16 @@ function buildProposalFromTemplate(pandocDocxPath, tmplPath, outputPath, coverDa
   if (coverData.date)
     coverXml = coverXml.replace(/June 10, 2026/g, xmlEscape(coverData.date))
 
-  // ── Step 4: Build new document.xml using PANDOC as the base ──────────────
-  // Keep pandoc's XML header (clean settings, no Word compat flags).
-  // Body = cover page from template + pandoc content + template page settings.
-  const pBodyOpenIdx  = pandocDocXml.indexOf("<w:body>") + "<w:body>".length
-  const pBodyCloseIdx = pandocDocXml.lastIndexOf("</w:body>")
+  // ── Step 4: Build new document.xml ───────────────────────────────────────
+  // Use the TEMPLATE's document.xml header (namespace declarations) so that
+  // the cover page XML (which uses wp14:, a14:, pic: etc.) is valid.
+  // Body = cover page + pandoc content + template page settings.
+  // Pandoc's settings.xml (no Word compat flags) is kept separately below.
   const newBody   = coverXml + "\n" + pandocBody + "\n" + finalSectPr
   const newDocXml =
-    pandocDocXml.substring(0, pBodyOpenIdx) + "\n" +
+    tmplDocXml.substring(0, tBodyOpenIdx) + "\n" +
     newBody + "\n" +
-    pandocDocXml.substring(pBodyCloseIdx)
+    tmplDocXml.substring(tBodyCloseIdx)
 
   pandocZip.updateFile("word/document.xml", Buffer.from(newDocXml, "utf-8"))
 
@@ -205,12 +205,28 @@ function buildProposalFromTemplate(pandocDocxPath, tmplPath, outputPath, coverDa
     }
   }
 
-  // ── Step 7: Wire header/footer into pandoc document rels + sectPr ─────────
+  // ── Step 7: Wire header/footer + media rels into pandoc document rels ──────
   let pandocRels = pandocZip.getEntry("word/_rels/document.xml.rels")?.getData().toString("utf-8") ?? ""
+  // Remove existing header/footer entries (we'll add template ones)
   pandocRels = pandocRels.replace(/<Relationship[^>]*\/(header|footer)"[^>]*\/>/g, "")
+  // Add header/footer relationship entries from template
   const newRelLines = hfRels.map(({ id, target, type }) =>
     `  <Relationship Id="${id}" Type="${type}" Target="${target}"/>`).join("\n")
-  pandocRels = pandocRels.replace("</Relationships>", newRelLines + "\n</Relationships>")
+  // Add media/image relationship entries from template (needed for cover page logo)
+  const mediaRelLines = []
+  for (const m of tmplDocRels.matchAll(/<Relationship\b([^>]*)\/>/g)) {
+    const attrs = m[1]
+    const type  = attrs.match(/\bType="([^"]+)"/)?.[1] ?? ""
+    if (type.includes("/image") || type.includes("/oleObject")) {
+      const id     = attrs.match(/\bId="([^"]+)"/)?.[1]
+      const target = attrs.match(/\bTarget="([^"]+)"/)?.[1]
+      if (id && target && !pandocRels.includes(`Id="${id}"`)) {
+        mediaRelLines.push(`  <Relationship Id="${id}" Type="${type}" Target="${target}"/>`)
+      }
+    }
+  }
+  const allNewRels = [newRelLines, ...mediaRelLines].filter(Boolean).join("\n")
+  pandocRels = pandocRels.replace("</Relationships>", allNewRels + "\n</Relationships>")
   pandocZip.updateFile("word/_rels/document.xml.rels", Buffer.from(pandocRels, "utf-8"))
 
   // Header/footer references + page size/margins into sectPr
