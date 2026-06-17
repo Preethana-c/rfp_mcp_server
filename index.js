@@ -5,7 +5,7 @@ import multer from "multer"
 import mammoth from "mammoth"
 import AdmZip from "adm-zip"
 import { execSync } from "child_process"
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs"
 import { join, extname, basename } from "path"
 import { fileURLToPath } from "url"
 import { dirname } from "path"
@@ -78,7 +78,7 @@ function buildProposalFromTemplate(pandocDocxPath, tmplPath, outputPath, coverDa
   const tmplZip   = new AdmZip(tmplPath)
   const pandocZip = new AdmZip(pandocDocxPath)
 
-  // ── Step 1: Extract pandoc body from clean pandoc output ─────────────────
+  // ── Extract pandoc body (strip pandoc's final sectPr) ────────────────────
   const pandocDocXml    = pandocZip.getEntry("word/document.xml").getData().toString("utf-8")
   const pandocBodyMatch = pandocDocXml.match(/<w:body>([\s\S]*?)<\/w:body>/)
   if (!pandocBodyMatch) throw new Error("Cannot parse pandoc output body")
@@ -86,26 +86,29 @@ function buildProposalFromTemplate(pandocDocxPath, tmplPath, outputPath, coverDa
     .replace(/<w:sectPr\b[\s\S]*?<\/w:sectPr>\s*$/, "")
     .trim()
 
-  // Normalise style names: pandoc uses "Heading 1" (space), template uses "Heading1"
+  // Normalise pandoc's default style names to match the Qmax template's style IDs.
+  // Pandoc without --reference-doc uses "Heading 1" (space); the template uses "Heading1".
   pandocBody = pandocBody
-    .replace(/w:val="Heading 1"/g,        'w:val="Heading1"')
-    .replace(/w:val="Heading 2"/g,        'w:val="Heading2"')
-    .replace(/w:val="Heading 3"/g,        'w:val="Heading3"')
-    .replace(/w:val="Heading 4"/g,        'w:val="Heading4"')
-    .replace(/w:val="Body Text"/g,        'w:val="Normal"')
-    .replace(/w:val="First Paragraph"/g,  'w:val="Normal"')
+    .replace(/w:val="Heading 1"/g,  'w:val="Heading1"')
+    .replace(/w:val="Heading 2"/g,  'w:val="Heading2"')
+    .replace(/w:val="Heading 3"/g,  'w:val="Heading3"')
+    .replace(/w:val="Heading 4"/g,  'w:val="Heading4"')
+    .replace(/w:val="Body Text"/g,  'w:val="Normal"')
+    .replace(/w:val="First Paragraph"/g, 'w:val="Normal"')
 
-  // ── Step 2: Extract cover page XML from template ──────────────────────────
-  const tmplDocXml   = tmplZip.getEntry("word/document.xml").getData().toString("utf-8")
-  const tBodyOpenIdx = tmplDocXml.indexOf("<w:body>") + "<w:body>".length
-  const tBodyCloseIdx = tmplDocXml.lastIndexOf("</w:body>")
-  const tmplBody     = tmplDocXml.substring(tBodyOpenIdx, tBodyCloseIdx)
+  // ── Clone template and find the cut point ────────────────────────────────
+  let tmplDocXml     = tmplZip.getEntry("word/document.xml").getData().toString("utf-8")
+  const bodyOpenIdx  = tmplDocXml.indexOf("<w:body>") + "<w:body>".length
+  const bodyCloseIdx = tmplDocXml.lastIndexOf("</w:body>")
+  const tmplBody     = tmplDocXml.substring(bodyOpenIdx, bodyCloseIdx)
   const finalSectPr  = (tmplBody.match(/<w:sectPr\b[\s\S]*?<\/w:sectPr>\s*$/) ?? [])[0] ?? ""
 
-  // Cut point: everything before the first Heading1/Heading2 paragraph = cover page + TOC
-  const firstH1Idx = tmplBody.indexOf('<w:pStyle w:val="Heading1"')
-  const firstH2Idx = tmplBody.indexOf('<w:pStyle w:val="Heading2"')
-  let firstHdgIdx  = -1
+  // The cover page + TOC section ends just before the first Heading1/Heading2
+  // paragraph in the template. Find that style reference, then look backwards
+  // to the enclosing <w:p> opening tag — that is the cut point.
+  const firstH1Idx  = tmplBody.indexOf('<w:pStyle w:val="Heading1"')
+  const firstH2Idx  = tmplBody.indexOf('<w:pStyle w:val="Heading2"')
+  let firstHdgIdx   = -1
   if (firstH1Idx !== -1 && firstH2Idx !== -1) firstHdgIdx = Math.min(firstH1Idx, firstH2Idx)
   else if (firstH1Idx !== -1) firstHdgIdx = firstH1Idx
   else if (firstH2Idx !== -1) firstHdgIdx = firstH2Idx
@@ -118,156 +121,55 @@ function buildProposalFromTemplate(pandocDocxPath, tmplPath, outputPath, coverDa
     if (pIdx !== -1) coverEndIdx = pIdx
   }
 
-  // ── Step 3: Apply cover page text substitutions ───────────────────────────
-  let coverXml = tmplBody.substring(0, coverEndIdx)
-  if (coverData.title)
-    coverXml = coverXml.replace(/Project Title/g, xmlEscape(coverData.title))
-  if (coverData.nature)
-    coverXml = coverXml.replace(/\(Project Nature description\)/g, xmlEscape(coverData.nature))
+  // ── Apply cover page text substitutions ──────────────────────────────────
+  let coverAndToc = tmplBody.substring(0, coverEndIdx)
+
+  if (coverData.title) {
+    coverAndToc = coverAndToc.replace(/Project Title/g, xmlEscape(coverData.title))
+  }
+  if (coverData.nature) {
+    coverAndToc = coverAndToc.replace(/\(Project Nature description\)/g, xmlEscape(coverData.nature))
+  }
   if (coverData.client) {
     const cXml = xmlEscape(coverData.client)
-    coverXml = coverXml.replace(/Customer name/g, cXml).replace(/Customer Name/g, cXml)
+    coverAndToc = coverAndToc.replace(/Customer name/g, cXml)
+    coverAndToc = coverAndToc.replace(/Customer Name/g, cXml)
   }
-  if (coverData.docNumber)
-    coverXml = coverXml.replace(/QMX-PRO-2026-SLMK-001/g, xmlEscape(coverData.docNumber))
-  if (coverData.date)
-    coverXml = coverXml.replace(/June 10, 2026/g, xmlEscape(coverData.date))
+  if (coverData.docNumber) {
+    coverAndToc = coverAndToc.replace(/QMX-PRO-2026-SLMK-001/g, xmlEscape(coverData.docNumber))
+  }
+  if (coverData.date) {
+    coverAndToc = coverAndToc.replace(/June 10, 2026/g, xmlEscape(coverData.date))
+  }
 
-  // ── Step 4: Build new document.xml ───────────────────────────────────────
-  // Use the TEMPLATE's document.xml header (namespace declarations) so that
-  // the cover page XML (which uses wp14:, a14:, pic: etc.) is valid.
-  // Body = cover page + pandoc content + template page settings.
-  // Pandoc's settings.xml (no Word compat flags) is kept separately below.
-  const newBody   = coverXml + "\n" + pandocBody + "\n" + finalSectPr
+  // ── Assemble: cover+TOC  +  pandoc content  +  template page settings ────
+  const newBody   = coverAndToc + "\n" + pandocBody + "\n" + finalSectPr
   const newDocXml =
-    tmplDocXml.substring(0, tBodyOpenIdx) + "\n" +
+    tmplDocXml.substring(0, bodyOpenIdx) + "\n" +
     newBody + "\n" +
-    tmplDocXml.substring(tBodyCloseIdx)
+    tmplDocXml.substring(bodyCloseIdx)
 
-  pandocZip.updateFile("word/document.xml", Buffer.from(newDocXml, "utf-8"))
+  tmplZip.updateFile("word/document.xml", Buffer.from(newDocXml, "utf-8"))
 
-  // ── Step 5: Inject template visual assets into pandoc ZIP ─────────────────
-  const tmpl = new Map()
-  tmplZip.getEntries().forEach(e => tmpl.set(e.entryName, e))
-
-  // Styles (heading colors, fonts, paragraph styles)
-  const stylesBuf = tmpl.get("word/styles.xml")?.getData()
-  if (stylesBuf) {
-    if (pandocZip.getEntry("word/styles.xml")) pandocZip.updateFile("word/styles.xml", stylesBuf)
-    else pandocZip.addFile("word/styles.xml", stylesBuf)
+  // ── Swap in pandoc's clean settings.xml (removes Word compat flags) ───────
+  const cleanSettings = pandocZip.getEntry("word/settings.xml")?.getData()
+  if (cleanSettings) {
+    if (tmplZip.getEntry("word/settings.xml")) tmplZip.updateFile("word/settings.xml", cleanSettings)
+    else tmplZip.addFile("word/settings.xml", cleanSettings)
   }
 
-  // Theme (accent colors, font scheme)
-  const themeBuf = tmpl.get("word/theme/theme1.xml")?.getData()
-  if (themeBuf) {
-    if (pandocZip.getEntry("word/theme/theme1.xml")) pandocZip.updateFile("word/theme/theme1.xml", themeBuf)
-    else pandocZip.addFile("word/theme/theme1.xml", themeBuf)
-  }
-
-  // Numbering (list/bullet styles)
-  const numBuf = tmpl.get("word/numbering.xml")?.getData()
-  if (numBuf) {
-    if (pandocZip.getEntry("word/numbering.xml")) pandocZip.updateFile("word/numbering.xml", numBuf)
-    else pandocZip.addFile("word/numbering.xml", numBuf)
-  }
-
-  // All media files (logo image + any other images from template)
-  for (const [name, entry] of tmpl) {
-    if (name.startsWith("word/media/")) {
-      if (pandocZip.getEntry(name)) pandocZip.updateFile(name, entry.getData())
-      else pandocZip.addFile(name, entry.getData())
+  // ── Copy pandoc inline images (charts, embedded pics from markdown) ───────
+  for (const entry of pandocZip.getEntries()) {
+    if (entry.entryName.startsWith("word/media/") && !tmplZip.getEntry(entry.entryName)) {
+      tmplZip.addFile(entry.entryName, entry.getData())
     }
   }
 
-  // ── Step 6: Copy header and footer files from template ────────────────────
-  const tmplDocRels = tmpl.get("word/_rels/document.xml.rels")?.getData().toString("utf-8") ?? ""
-  const hfRels = []
-  for (const m of tmplDocRels.matchAll(/<Relationship\b([^>]*)\/>/g)) {
-    if (/\/(header|footer)"/.test(m[1])) {
-      const id     = m[1].match(/\bId="([^"]+)"/)?.[1]
-      const target = m[1].match(/\bTarget="([^"]+)"/)?.[1]
-      const type   = m[1].match(/\bType="([^"]+)"/)?.[1]
-      if (id && target && type) hfRels.push({ id, target, type })
-    }
-  }
-  for (const { target } of hfRels) {
-    const hfPath     = `word/${target}`
-    const hfRelsPath = `word/_rels/${target.split("/").pop()}.rels`
-    const hfBuf      = tmpl.get(hfPath)?.getData()
-    if (hfBuf) {
-      if (pandocZip.getEntry(hfPath)) pandocZip.updateFile(hfPath, hfBuf)
-      else pandocZip.addFile(hfPath, hfBuf)
-    }
-    const hfRelsBuf = tmpl.get(hfRelsPath)?.getData()
-    if (hfRelsBuf) {
-      if (pandocZip.getEntry(hfRelsPath)) pandocZip.updateFile(hfRelsPath, hfRelsBuf)
-      else pandocZip.addFile(hfRelsPath, hfRelsBuf)
-    }
-  }
+  // ── Apply table borders ───────────────────────────────────────────────────
+  const merged = tmplZip.getEntry("word/document.xml").getData().toString("utf-8")
+  tmplZip.updateFile("word/document.xml", Buffer.from(_applyTableBordersXml(merged), "utf-8"))
 
-  // ── Step 7: Wire header/footer + media rels into pandoc document rels ──────
-  let pandocRels = pandocZip.getEntry("word/_rels/document.xml.rels")?.getData().toString("utf-8") ?? ""
-  // Remove existing header/footer entries (we'll add template ones)
-  pandocRels = pandocRels.replace(/<Relationship[^>]*\/(header|footer)"[^>]*\/>/g, "")
-  // Add header/footer relationship entries from template
-  const newRelLines = hfRels.map(({ id, target, type }) =>
-    `  <Relationship Id="${id}" Type="${type}" Target="${target}"/>`).join("\n")
-  // Add media/image relationship entries from template (needed for cover page logo)
-  const mediaRelLines = []
-  for (const m of tmplDocRels.matchAll(/<Relationship\b([^>]*)\/>/g)) {
-    const attrs = m[1]
-    const type  = attrs.match(/\bType="([^"]+)"/)?.[1] ?? ""
-    if (type.includes("/image") || type.includes("/oleObject")) {
-      const id     = attrs.match(/\bId="([^"]+)"/)?.[1]
-      const target = attrs.match(/\bTarget="([^"]+)"/)?.[1]
-      if (id && target && !pandocRels.includes(`Id="${id}"`)) {
-        mediaRelLines.push(`  <Relationship Id="${id}" Type="${type}" Target="${target}"/>`)
-      }
-    }
-  }
-  const allNewRels = [newRelLines, ...mediaRelLines].filter(Boolean).join("\n")
-  pandocRels = pandocRels.replace("</Relationships>", allNewRels + "\n</Relationships>")
-  pandocZip.updateFile("word/_rels/document.xml.rels", Buffer.from(pandocRels, "utf-8"))
-
-  // Header/footer references + page size/margins into sectPr
-  const hfElements = []
-  for (const m of finalSectPr.matchAll(/<w:(header|footer)Reference\b[^/]*/g))
-    hfElements.push(m[0] + "/>")
-  const hasTitlePg = finalSectPr.includes("<w:titlePg/>")
-  const pgSz  = tmplDocXml.match(/<w:pgSz\b[^/]*\/>/)?.[0]  ?? ""
-  const pgMar = tmplDocXml.match(/<w:pgMar\b[^/]*\/>/)?.[0] ?? ""
-
-  let docXml = pandocZip.getEntry("word/document.xml").getData().toString("utf-8")
-  docXml = docXml
-    .replace(/<w:headerReference[^/]*\/>/g, "")
-    .replace(/<w:footerReference[^/]*\/>/g, "")
-    .replace(/<w:titlePg\/>/g, "")
-    .replace(/<w:pgSz\b[^/]*\/>/g, "")
-    .replace(/<w:pgMar\b[^/]*\/>/g, "")
-  const sectPrInsert = [...hfElements, hasTitlePg ? "<w:titlePg/>" : "", pgSz, pgMar]
-    .filter(Boolean).join("\n")
-  docXml = docXml.includes("</w:sectPr>")
-    ? docXml.replace("</w:sectPr>", sectPrInsert + "\n</w:sectPr>")
-    : docXml.replace("</w:body>", `<w:sectPr>\n${sectPrInsert}\n</w:sectPr>\n</w:body>`)
-  pandocZip.updateFile("word/document.xml", Buffer.from(docXml, "utf-8"))
-
-  // ── Step 8: Update Content_Types for header/footer ────────────────────────
-  let ctXml = pandocZip.getEntry("[Content_Types].xml")?.getData().toString("utf-8") ?? ""
-  for (const { target } of hfRels) {
-    const ct       = target.includes("header")
-      ? "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"
-      : "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"
-    const partName = `/word/${target}`
-    if (!ctXml.includes(partName))
-      ctXml = ctXml.replace("</Types>", `  <Override PartName="${partName}" ContentType="${ct}"/>\n</Types>`)
-  }
-  pandocZip.updateFile("[Content_Types].xml", Buffer.from(ctXml, "utf-8"))
-
-  // ── Step 9: Table borders + write output ─────────────────────────────────
-  const finalDoc = pandocZip.getEntry("word/document.xml").getData().toString("utf-8")
-  pandocZip.updateFile("word/document.xml", Buffer.from(_applyTableBordersXml(finalDoc), "utf-8"))
-
-  pandocZip.writeZip(outputPath)
+  tmplZip.writeZip(outputPath)
 }
 
 // ── Template asset injection (legacy fallback) ────────────────────────────────
@@ -647,9 +549,7 @@ function createMcpServer() {
 
       const mdPath  = join(OUTPUT_DIR, "proposal-draft.md")
       const outPath = join(OUTPUT_DIR, safeName)
-      readdirSync(OUTPUT_DIR).forEach(f => { try { unlinkSync(join(OUTPUT_DIR, f)) } catch {} })
       writeFileSync(mdPath, mdForPandoc, "utf-8")
-
 
       try { execSync("pandoc --version", { stdio: "pipe" }) } catch {
         return { content: [{ type: "text", text: "pandoc is not installed on this server." }] }
