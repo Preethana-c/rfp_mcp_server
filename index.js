@@ -542,7 +542,9 @@ function createMcpServer() {
 
       const mdPath  = join(OUTPUT_DIR, "proposal-draft.md")
       const outPath = join(OUTPUT_DIR, safeName)
+      readdirSync(OUTPUT_DIR).forEach(f => { try { unlinkSync(join(OUTPUT_DIR, f)) } catch {} })
       writeFileSync(mdPath, mdForPandoc, "utf-8")
+
 
       try { execSync("pandoc --version", { stdio: "pipe" }) } catch {
         return { content: [{ type: "text", text: "pandoc is not installed on this server." }] }
